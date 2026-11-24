@@ -24,11 +24,17 @@ def get_store() -> Store:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _store
-    _store = Store()
-    yield
-    if _store is not None:
-        _store.close()
-        _store = None
+    # 测试可预先设置 main._store（同一 data_dir / 注入故障闸门）；
+    # 已存在时不要覆盖，且关闭责任仍归创建/注入它的一方。
+    owns_store = _store is None
+    if owns_store:
+        _store = Store()
+    try:
+        yield
+    finally:
+        if owns_store and _store is not None:
+            _store.close()
+            _store = None
 
 
 app = FastAPI(

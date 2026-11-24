@@ -287,22 +287,48 @@ def _parse_file(path: str, build_id: str) -> _ParsedELF:
 
 
 class Symbolizer:
-    """按文件路径惰性解析并缓存 _ParsedELF。
+    """按内容身份（sha256，缺省退回 realpath）惰性解析并缓存 _ParsedELF。
 
-    缓存键带发布版本，文件一旦发布即不可变，因此缓存可长期复用。
+    ELF 按 sha256 内容寻址落盘，已发布内容不可变，因此以内容哈希为键可长期
+    复用。**不能只按 Build ID 缓存**：首次发布若在数据库提交前被查询并解析、
+    随后提交失败回滚，另一份同 Build ID 但内容不同的 ELF 可能发布成功；只按
+    Build ID 取缓存会把第一次（未发布）源码一直返回，且重启后缓存清空又得到
+    另一份结果。按内容身份键控后，不同文件互不污染。
     """
 
     def __init__(self) -> None:
         self._cache: dict[str, _ParsedELF] = {}
 
-    def symbolize(self, path: str, build_id: str, address: int) -> FrameSymbol:
-        parsed = self._cache.get(build_id)
+    @staticmethod
+    def _key_for(path: str, cache_key: Optional[str]) -> str:
+        # 调用方（Store）传 sha256；直接使用 Symbolizer 的旧调用方式则以
+        # realpath 为键——发布路径本身是 ``{sha256}.elf``，同样能区分内容。
+        return cache_key or os.path.realpath(path)
+
+    def symbolize(
+        self,
+        path: str,
+        build_id: str,
+        address: int,
+        cache_key: Optional[str] = None,
+    ) -> FrameSymbol:
+        key = self._key_for(path, cache_key)
+        parsed = self._cache.get(key)
         if parsed is None:
             parsed = _parse_file(path, build_id)
-            self._cache[build_id] = parsed
+            self._cache[key] = parsed
         function = parsed.lookup_function(address)
         file, line = parsed.lookup_line(address)
         return FrameSymbol(function=function, file=file, line=line)
 
+    def evict_key(self, cache_key: str) -> None:
+        """按内容身份逐出（发布失败清理暂存内容时使用）。"""
+        self._cache.pop(cache_key, None)
+        self._cache.pop(os.path.realpath(cache_key), None)
+
     def evict(self, build_id: str) -> None:
+        """逐出该 Build ID 对应的全部内容缓存（启动核对/兼容旧调用）。"""
+        for key in [k for k, parsed in self._cache.items() if parsed.build_id == build_id]:
+            del self._cache[key]
+        # 旧实现直接以 build_id 为键，顺手清理可能的残留
         self._cache.pop(build_id, None)

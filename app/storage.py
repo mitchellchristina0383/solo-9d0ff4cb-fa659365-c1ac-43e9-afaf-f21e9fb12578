@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterator, Optional
 
 from .config import settings
 from .elftools_ext import ELFValidationError, FrameSymbol, Symbolizer, inspect_blob
@@ -41,15 +44,33 @@ class Store:
         self.elf_dir = os.path.join(self.data_dir, settings.elf_dir_name)
         self.db_path = os.path.join(self.data_dir, settings.db_name)
         os.makedirs(self.elf_dir, exist_ok=True)
-        # 粗粒度锁：发布互斥；查询用快照版本号，不阻塞发布
+        # 粗粒度锁：仅序列化发布/报告写入；查询走独立只读连接 + 版本快照，
+        # 不持这把锁，也绝不使用 self._conn（避免读到发布事务未提交的脏数据）。
         self._lock = threading.RLock()
         self._symbolizer = Symbolizer()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL");
-        self._conn.execute("PRAGMA foreign_keys=ON");
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
         self._reconcile_disk()
+
+    @contextmanager
+    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+        """每次查询使用一条全新的独立连接。
+
+        - 与发布写连接分开：写事务提交前，其它连接只能看到上一个已提交版本，
+          从根上消除“提交前查询读到未提交 Build ID 映射并污染缓存”；
+        - WAL 下读不阻塞写、写不阻塞读，提交暂停期间查栈照常可用；
+        - 连接随查询关闭，线程之间不共享事务状态。
+        """
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            yield conn
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # schema 与启动恢复
@@ -96,7 +117,12 @@ class Store:
 
     @property
     def symbol_version(self) -> int:
-        return int(self._conn.execute("SELECT value FROM meta WHERE key='symbol_version'").fetchone()["value"])
+        # 始终读“当前已提交”值：独立连接看不到发布中未提交的版本号。
+        with self._read_connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='symbol_version'"
+            ).fetchone()
+        return int(row["value"])
 
     # ------------------------------------------------------------------
     # 批量发布
@@ -182,7 +208,20 @@ class Store:
                             "UPDATE meta SET value=? WHERE key='symbol_version'",
                             (next_version,),
                         )
+                        # 提交前拦截点：默认只读一个不存在即跳过的控制文件；
+                        # 测试可覆盖它来模拟“提交暂停”或“提交失败”。
+                        self._commit_gate()
                 except BaseException:
+                    # 无论 with 上下文已回滚、还是 commit 本身失败，都确保写
+                    # 连接没有残留事务，否则下一次发布的冲突核对会读到脏行。
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    # 内容键缓存按 sha256 隔离；这里再逐出本次未遂内容，
+                    # 保证回滚后进程内也不留任何可能被误取的解析结果。
+                    for _bid, digest, _path in new_entries:
+                        self._symbolizer.evict_key(digest)
                     for path in staged_paths:
                         try:
                             os.remove(path)
@@ -196,6 +235,50 @@ class Store:
             "redundant": redundant,
             "symbol_version": self.symbol_version,
         }
+
+    def _commit_gate(self) -> None:
+        """发布事务 ``COMMIT`` 前的拦截点。
+
+        两种用法：
+
+        1. 测试直接覆盖本方法（``store._commit_gate = lambda: event.wait()``
+           或 ``monkeypatch.setattr(Store, "_commit_gate", ...)``），阻塞即
+           “提交暂停”，抛异常即“提交失败”。
+        2. 不改代码的故障演练（含 Docker Compose）：往控制文件写 JSON——
+           路径取 ``$SYMBOL_COMMIT_CONTROL``，否则为
+           ``<SYMBOL_DATA_DIR>/commit-control.json``::
+
+               {"pause_seconds": 3, "fail_next_commit": true}
+
+           文件不存在时立即返回（默认关闭）；``fail_next_commit`` 是一次性
+           开关，触发后自动改写为 false。暂停期间写事务保持打开，正好验证
+           “提交暂停时查栈只看到已提交快照”。
+        """
+        ctl = os.environ.get("SYMBOL_COMMIT_CONTROL") or os.path.join(
+            self.data_dir, "commit-control.json"
+        )
+        try:
+            with open(ctl, "r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            return
+        if not isinstance(cfg, dict):
+            return
+        try:
+            pause = float(cfg.get("pause_seconds") or 0)
+        except (TypeError, ValueError):
+            pause = 0.0
+        if pause > 0:
+            time.sleep(min(pause, 600.0))
+        if cfg.get("fail_next_commit"):
+            try:
+                with open(ctl, "w", encoding="utf-8") as fh:
+                    json.dump({"pause_seconds": 0, "fail_next_commit": False}, fh)
+            except OSError:
+                pass
+            raise RuntimeError("commit-control: 注入的提交失败（fail_next_commit）")
 
     # ------------------------------------------------------------------
     # 报告
@@ -213,38 +296,44 @@ class Store:
             return report_id
 
     def get_report_raw(self, report_id: int) -> Optional[dict]:
-        report = self._conn.execute(
-            "SELECT id, created_at FROM reports WHERE id=?", (report_id,)
-        ).fetchone()
-        if report is None:
-            return None
-        frames = self._conn.execute(
-            "SELECT position, build_id, address FROM frames"
-            " WHERE report_id=? ORDER BY position",
-            (report_id,),
-        ).fetchall()
-        return {
-            "report_id": report["id"],
-            "created_at": report["created_at"],
-            "frames": [
-                {"position": f["position"], "build_id": f["build_id"], "address": f["address"]}
-                for f in frames
-            ],
-        }
+        with self._read_connection() as conn:
+            report = conn.execute(
+                "SELECT id, created_at FROM reports WHERE id=?", (report_id,)
+            ).fetchone()
+            if report is None:
+                return None
+            frames = conn.execute(
+                "SELECT position, build_id, address FROM frames"
+                " WHERE report_id=? ORDER BY position",
+                (report_id,),
+            ).fetchall()
+            return {
+                "report_id": report["id"],
+                "created_at": report["created_at"],
+                "frames": [
+                    {"position": f["position"], "build_id": f["build_id"], "address": f["address"]}
+                    for f in frames
+                ],
+            }
 
     # ------------------------------------------------------------------
     # 快照符号化
     # ------------------------------------------------------------------
     def snapshot_paths(self, version: int) -> dict[str, StoredELF]:
-        """取 <= version 的已发布 ELF 映射（查询开始时调用一次）。"""
-        rows = self._conn.execute(
-            "SELECT build_id, sha256, path, version FROM elfs WHERE version <= ?",
-            (version,),
-        ).fetchall()
-        return {
-            r["build_id"]: StoredELF(r["build_id"], r["sha256"], r["path"], r["version"])
-            for r in rows
-        }
+        """取 <= version 的已发布 ELF 映射（查询开始时调用一次）。
+
+        走独立读连接：只能读到已提交数据，发布事务提交前的新 Build ID
+        不会出现在快照里。
+        """
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                "SELECT build_id, sha256, path, version FROM elfs WHERE version <= ?",
+                (version,),
+            ).fetchall()
+            return {
+                r["build_id"]: StoredELF(r["build_id"], r["sha256"], r["path"], r["version"])
+                for r in rows
+            }
 
     def resolve_report(self, report_id: int, snapshot_version: Optional[int] = None) -> Optional[dict]:
         version = self.symbol_version if snapshot_version is None else snapshot_version
@@ -279,7 +368,7 @@ class Store:
                         resolved_frames.append(item)
                         continue
                     sym: FrameSymbol = self._symbolizer.symbolize(
-                        stored.path, stored.build_id, address
+                        stored.path, stored.build_id, address, cache_key=stored.sha256
                     )
                     item["function"] = sym.function
                     item["source_file"] = sym.file
@@ -300,10 +389,11 @@ class Store:
         }
 
     def list_build_ids(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT build_id, sha256, version FROM elfs ORDER BY build_id"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        with self._read_connection() as conn:
+            rows = conn.execute(
+                "SELECT build_id, sha256, version FROM elfs ORDER BY build_id"
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def close(self) -> None:
         self._conn.close()

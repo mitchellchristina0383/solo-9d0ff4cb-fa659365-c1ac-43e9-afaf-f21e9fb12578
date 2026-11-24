@@ -12,9 +12,11 @@
 | 同号内容冲突 | Build ID → sha256 唯一映射，哈希不同即退回，已发布内容不可变 |
 | 相同文件重传成功 | 幂等：计入 `redundant`，版本号不前进；同批内重复文件按去重处理 |
 | 查询期间可发布 | 全局符号版本号每次有效发布 +1；查询在开始时取一次版本快照，只解析 `version <= 快照版本` 的 ELF |
+| 提交暂停也能查栈 | 查询每次新建独立只读连接（`query_only`），只能读到**已提交**数据；发布事务 `COMMIT` 前的未提交映射/版本号不可见，WAL 下读不阻塞写 |
+| 回滚后可换同号文件重传 | 符号缓存以 **sha256 内容身份**为键（非 Build ID）；首次提交失败回滚并清理暂存后，换一份同 Build ID 的 ELF 重传成功，原报告号立即指向新内容，与重启后完全一致 |
 | 未解析帧保留原地址 | 帧原样持久化，响应中带 `status=unresolved` 与原因；补传后用同一报告号再查即可 |
 | 重启后可查 | 报告/帧、Build ID 映射、版本号全部存 SQLite（WAL）；ELF 按 sha256 内容寻址落盘；启动时核对并清理悬挂映射 |
-| 查栈与发布并行 | 发布仅持短写锁，查询走只读快照；ELF 解析结果按 Build ID 惰性缓存且不可变，可跨线程共享 |
+| 查栈与发布并行 | 发布仅持短写锁，查询走独立连接上的版本快照；ELF 解析结果按 sha256 惰性缓存且内容不可变，可跨线程共享，同 Build ID 换内容也不会串用 |
 | Docker Compose | 单服务 + 命名卷 `symbol-data:/data`，`/docs` 提供 Swagger 演示 |
 
 ### 目录结构
@@ -84,6 +86,36 @@ pytest -q
 
 固件包含：固定 Build ID 的可执行文件与共享库、DWARF v4/v5 各一份、同 Build ID 冲突文件、
 无 Build ID 文件、strip 调试信息文件、非 ELF 文件。
+
+`tests/test_commit_race.py` 额外覆盖本次事故的验收点：未提交事务/提交闸门暂停期间查询只得到
+已提交快照（v0、未解析）；首次发布抛错回滚后无映射、无暂存文件、帧保持未解析；换同号不同内容
+ELF 重传后原报告指向 `demo_conflict.c`，且与新建 Store（模拟重启）结果逐字段一致；并含真实
+uvicorn + HTTP 的完整交错用例。需要人为暂停/制造提交失败时，可覆盖 `Store._commit_gate`
+（在事务内 `COMMIT` 前调用，默认无操作）。
+
+### 提交暂停 / 回滚换文件重传演练（Docker Compose）
+
+默认闸门还会读取控制文件 `$SYMBOL_DATA_DIR/commit-control.json`（或 `$SYMBOL_COMMIT_CONTROL`
+指定路径；文件不存在即完全关闭）。先在 `/docs` 或 `POST /reports` 拿到报告号 `RID`，然后：
+
+```bash
+# 1) 提交暂停：让下一次发布在 COMMIT 前停 5 秒
+docker compose exec symbol-server sh -c \
+  'echo "{\"pause_seconds\":5}" > /data/commit-control.json'
+#    此时在 /docs 上传 ELF；5 秒内 GET /reports/{RID}：
+#    服务不阻塞，snapshot_symbol_version 仍是上一个已提交版本，帧为 unresolved
+
+# 2) 回滚后换文件重传：令下一次提交失败（一次性，触发后自动清掉 fail 标记）
+docker compose exec symbol-server sh -c \
+  'echo "{\"pause_seconds\":1,\"fail_next_commit\":true}" > /data/commit-control.json'
+#    上传第一份同 Build ID ELF -> 500（整批回滚，暂存文件清理）；
+#    再 GET /reports/{RID} 仍 unresolved；
+#    改传另一份同 Build ID、不同内容的 ELF -> 200，原报告号即指向新源码。
+
+# 收尾：移除控制文件，发布不再暂停
+docker compose exec symbol-server rm -f /data/commit-control.json
+```
+
 
 ## 余项 / 已知边界
 
